@@ -83,3 +83,15 @@ CREATE TABLE orders (
 CREATE INDEX idx_orders_clerk_id ON orders(clerk_id);
 CREATE INDEX idx_orders_created_at ON orders(created_at);
 CREATE INDEX idx_orders_total ON orders(total);
+
+-- ==========================================
+-- 5. ROLES
+-- ==========================================
+CREATE TABLE roles (
+    id SERIAL PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    permissions JSONB -- Stores []string
+);
+
+CREATE INDEX idx_roles_slug ON roles(slug);

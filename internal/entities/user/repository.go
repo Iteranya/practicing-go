@@ -455,6 +455,6 @@ func (r *userRepository) unmarshalUserData(user *User, settingJSON, customJSON [
 	return nil
 }
 
-func isDuplicateKeyError(err error) bool {
+func isDuplicateKeyError(_ error) bool {
 	return false
 }
