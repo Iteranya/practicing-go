@@ -94,18 +94,21 @@ func (r *orderRepository) Create(ctx context.Context, order *Order) error {
 }
 
 func (r *orderRepository) GetByID(ctx context.Context, id int) (*Order, error) {
+	// 1. Add created_at to the SELECT query
 	query := `
-		SELECT id, items, clerk_id, total, paid, change, custom
-		FROM orders
-		WHERE id = $1
-	`
+        SELECT id, items, clerk_id, total, paid, change, custom, created_at
+        FROM orders
+        WHERE id = $1
+    `
 
 	order := &Order{}
 	var itemsJSON, customJSON []byte
+	var createdAt time.Time // 2. Create a temp variable for the timestamp
 
+	// 3. Scan into the temp variable
 	err := r.db.QueryRowContext(ctx, query, id).Scan(
 		&order.Id, &itemsJSON, &order.ClerkId,
-		&order.Total, &order.Paid, &order.Change, &customJSON,
+		&order.Total, &order.Paid, &order.Change, &customJSON, &createdAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -114,6 +117,9 @@ func (r *orderRepository) GetByID(ctx context.Context, id int) (*Order, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get order: %w", err)
 	}
+
+	// 4. Convert time.Time to int64 (Unix timestamp)
+	order.Created = createdAt.Unix()
 
 	if err := r.unmarshalOrderData(order, itemsJSON, customJSON); err != nil {
 		return nil, err
@@ -186,7 +192,7 @@ func (r *orderRepository) Delete(ctx context.Context, id int) error {
 
 func (r *orderRepository) List(ctx context.Context, opts OrderListOptions) ([]*Order, error) {
 	query := `
-		SELECT id, items, clerk_id, total, paid, change, custom
+		SELECT id, items, clerk_id, total, paid, change, custom, created_at
 		FROM orders
 		WHERE 1=1
 	`
@@ -274,7 +280,7 @@ func (r *orderRepository) List(ctx context.Context, opts OrderListOptions) ([]*O
 
 func (r *orderRepository) GetByClerk(ctx context.Context, clerkId int) ([]*Order, error) {
 	query := `
-		SELECT id, items, clerk_id, total, paid, change, custom
+		SELECT id, items, clerk_id, total, paid, change, custom, created_at
 		FROM orders
 		WHERE clerk_id = $1
 		ORDER BY created_at DESC
@@ -304,7 +310,7 @@ func (r *orderRepository) GetByClerk(ctx context.Context, clerkId int) ([]*Order
 
 func (r *orderRepository) GetByDateRange(ctx context.Context, start, end time.Time) ([]*Order, error) {
 	query := `
-		SELECT id, items, clerk_id, total, paid, change, custom
+		SELECT id, items, clerk_id, total, paid, change, custom, created_at
 		FROM orders
 		WHERE created_at >= $1 AND created_at <= $2
 		ORDER BY created_at DESC
@@ -430,7 +436,7 @@ func (r *orderRepository) Count(ctx context.Context) (int, error) {
 
 func (r *orderRepository) GetRecentOrders(ctx context.Context, limit int) ([]*Order, error) {
 	query := `
-		SELECT id, items, clerk_id, total, paid, change, custom
+		SELECT id, items, clerk_id, total, paid, change, custom, created_at
 		FROM orders
 		ORDER BY created_at DESC
 		LIMIT $1
@@ -465,14 +471,19 @@ func (r *orderRepository) scanOrder(scanner interface {
 }) (*Order, error) {
 	order := &Order{}
 	var itemsJSON, customJSON []byte
+	var createdAt time.Time // Temp variable
 
+	// Scan created_at
 	err := scanner.Scan(
 		&order.Id, &itemsJSON, &order.ClerkId,
-		&order.Total, &order.Paid, &order.Change, &customJSON,
+		&order.Total, &order.Paid, &order.Change, &customJSON, &createdAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan order: %w", err)
 	}
+
+	// Convert to int64
+	order.Created = createdAt.Unix()
 
 	if err := r.unmarshalOrderData(order, itemsJSON, customJSON); err != nil {
 		return nil, err
