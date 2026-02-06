@@ -5,8 +5,16 @@ import (
 	"errors"
 )
 
+var (
+	ErrPasswordTooShort = errors.New("password must be at least 6 characters")
+)
+
 type UserService interface {
+	// Authentication
 	RegisterUser(ctx context.Context, input UserInput) (*User, error)
+	Login(ctx context.Context, username, password string) (string, *User, error)
+
+	// User Management
 	GetUser(ctx context.Context, idOrUsername any) (*User, error)
 	UpdateUser(ctx context.Context, id int, input UserInput) error
 	DeleteUser(ctx context.Context, id int) error
@@ -21,7 +29,7 @@ type UserService interface {
 // UserInput separates the API request shape from the Database Model
 type UserInput struct {
 	Username    string         `json:"username"`
-	Password    string         `json:"password"` // Raw password
+	Password    string         `json:"password"` // Raw password, only used on Create
 	DisplayName string         `json:"display_name"`
 	Role        string         `json:"role"`
 	Setting     map[string]any `json:"setting"`
@@ -44,36 +52,69 @@ func NewUserService(repo UserRepository) UserService {
 	return &userService{repo: repo}
 }
 
+// RegisterUser handles creation and hashing of the password
 func (s *userService) RegisterUser(ctx context.Context, input UserInput) (*User, error) {
-	// Validation
 	if input.Username == "" || input.Password == "" {
 		return nil, ErrInvalidUserInput
 	}
 
-	// Default role if empty
+	if len(input.Password) < 6 {
+		return nil, ErrPasswordTooShort
+	}
+
 	if input.Role == "" {
 		input.Role = "staff"
 	}
 
-	// TODO: Replace this with proper hashing (e.g., bcrypt.GenerateFromPassword)
-	hashedPassword := "hashed_" + input.Password
-
+	// Create the domain entity
 	newUser := &User{
 		Username:    input.Username,
-		Hash:        hashedPassword,
 		DisplayName: input.DisplayName,
 		Role:        input.Role,
-		Active:      true, // Active by default
+		Active:      true, // Active by default on register
 		Setting:     input.Setting,
 		Custom:      input.Custom,
 	}
 
-	err := s.repo.Create(ctx, newUser)
-	if err != nil {
+	// Use domain logic from auth.go to hash password
+	if err := newUser.SetPassword(input.Password); err != nil {
+		return nil, err
+	}
+
+	// Save to DB
+	if err := s.repo.Create(ctx, newUser); err != nil {
 		return nil, err
 	}
 
 	return newUser, nil
+}
+
+// Login verifies credentials and returns a JWT token + User Info
+func (s *userService) Login(ctx context.Context, username, password string) (string, *User, error) {
+	// 1. Find User
+	u, err := s.repo.GetByUsername(ctx, username)
+	if err != nil {
+		// Mask specific DB errors for security, just say invalid creds
+		return "", nil, ErrInvalidCredentials
+	}
+
+	// 2. Check Active Status
+	if !u.Active {
+		return "", nil, errors.New("user account is inactive")
+	}
+
+	// 3. Check Password (domain logic)
+	if !u.CheckPassword(password) {
+		return "", nil, ErrInvalidCredentials
+	}
+
+	// 4. Generate Token (domain logic)
+	token, err := GenerateToken(u)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return token, u, nil
 }
 
 func (s *userService) GetUser(ctx context.Context, idOrUsername any) (*User, error) {
@@ -114,6 +155,7 @@ func (s *userService) UpdateUser(ctx context.Context, id int, input UserInput) e
 	if input.Custom != nil {
 		existing.Custom = input.Custom
 	}
+	// Note: We deliberately do NOT update Password here. Use ChangePassword.
 
 	return s.repo.Update(ctx, existing)
 }
@@ -145,13 +187,18 @@ func (s *userService) ListUsers(ctx context.Context, params UserServiceListParam
 
 func (s *userService) ChangePassword(ctx context.Context, id int, newPassword string) error {
 	if len(newPassword) < 6 {
-		return errors.New("password too short")
+		return ErrPasswordTooShort
 	}
 
-	// TODO: Replace with real hashing
-	newHash := "hashed_" + newPassword
+	// We use a temporary user struct to access the SetPassword logic
+	// to avoid rewriting the bcrypt logic here.
+	tempUser := &User{}
+	if err := tempUser.SetPassword(newPassword); err != nil {
+		return err
+	}
 
-	return s.repo.UpdatePassword(ctx, id, newHash)
+	// Push the new hash to the repository
+	return s.repo.UpdatePassword(ctx, id, tempUser.Hash)
 }
 
 func (s *userService) UpdateSettings(ctx context.Context, id int, settings map[string]any) error {

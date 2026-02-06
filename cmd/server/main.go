@@ -1,16 +1,20 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	// 1. Database Driver
+	_ "github.com/lib/pq"
+
+	// 2. Internal Imports (Replace with your actual module path)
 	"github.com/iteranya/practicing-go/internal/database"
 	"github.com/iteranya/practicing-go/internal/utils"
 
-	// Import your entity packages
 	"github.com/iteranya/practicing-go/internal/entities/inventory"
 	"github.com/iteranya/practicing-go/internal/entities/order"
 	"github.com/iteranya/practicing-go/internal/entities/product"
@@ -19,7 +23,9 @@ import (
 )
 
 func main() {
+	// =========================================================================
 	// 1. Configuration
+	// =========================================================================
 	dbConfig := database.Config{
 		Driver:          "postgres",
 		DSN:             getEnv("DB_DSN", "postgres://user:pass@localhost:5432/pos_db?sslmode=disable"),
@@ -27,69 +33,98 @@ func main() {
 		MaxIdleConns:    25,
 		ConnMaxLifetime: 5 * time.Minute,
 	}
-
 	port := getEnv("PORT", ":8080")
 
-	// 2. Database Connection
+	// =========================================================================
+	// 2. Infrastructure
+	// =========================================================================
 	db, err := database.NewDatabase(dbConfig)
 	if err != nil {
-		log.Fatalf("Could not initialize database: %v", err)
+		log.Fatalf("Fatal: Could not initialize database: %v", err)
 	}
 	defer db.Close()
 	log.Println("Database connected successfully.")
 
-	// 3. Initialize Repositories
+	// =========================================================================
+	// 3. Dependency Injection
+	// =========================================================================
+
+	// -- Repositories --
 	roleRepo := role.NewRoleRepository(db)
 	userRepo := user.NewUserRepository(db)
 	invRepo := inventory.NewInventoryRepository(db)
 	prodRepo := product.NewProductRepository(db)
 	orderRepo := order.NewOrderRepository(db)
 
-	// 4. Initialize Services (Business Logic)
+	// -- Services --
 	roleSvc := role.NewRoleService(roleRepo)
 	userSvc := user.NewUserService(userRepo)
 	invSvc := inventory.NewInventoryService(invRepo)
 	prodSvc := product.NewProductService(prodRepo)
 	orderSvc := order.NewOrderService(orderRepo)
 
-	// 5. Initialize Handlers (HTTP Layer)
+	// -- Handlers --
 	roleH := role.NewRoleHandler(roleSvc)
 	userH := user.NewUserHandler(userSvc)
 	invH := inventory.NewInventoryHandler(invSvc)
 	prodH := product.NewProductHandler(prodSvc)
 	orderH := order.NewOrderHandler(orderSvc)
 
-	// 6. Router Setup (Go 1.22+)
-	router := http.NewServeMux()
+	// =========================================================================
+	// 4. Routing
+	// =========================================================================
+	rootMux := http.NewServeMux()
 
-	// --- Public Routes ---
-	router.HandleFunc("POST /api/v1/login", makeLoginHandler(userSvc))
-	router.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+	// --- A. Public Routes ---
+	rootMux.HandleFunc("POST /api/v1/login", userH.HandleLogin)
+	rootMux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		w.Write([]byte(`{"status": "ok"}`))
 	})
 
-	// --- Protected Routes (Require Auth) ---
+	// --- B. Protected Routes ---
+	// Mux for routes that require a valid JWT
 	protectedMux := http.NewServeMux()
 
-	// Register entity routes to the protected mux
+	// 1. Bulk Register (Standard CRUD)
+	// These will only require Authentication (valid token).
+	// If you want granular permission checks (e.g. only Admin can Delete),
+	// access control must be handled inside the Service layer OR by manually
+	// wrapping specific routes below instead of using RegisterRoutes.
 	roleH.RegisterRoutes(protectedMux)
 	userH.RegisterRoutes(protectedMux)
 	invH.RegisterRoutes(protectedMux)
 	prodH.RegisterRoutes(protectedMux)
 	orderH.RegisterRoutes(protectedMux)
 
-	// Mount protected routes under /api/v1/
-	// We strip the prefix so the handlers defined as "GET /users" match correctly
-	router.Handle("/api/v1/", http.StripPrefix("/api/v1", utils.RequireAuth(protectedMux)))
+	/*
+	   // EXAMPLE: How to enforce granular permissions in main.go
+	   // This overrides the bulk registration above for specific endpoints.
+	   // You would need to make the AuthMiddleware and Authorize middleware accessible here.
 
-	// 7. Middlewares (Logging)
-	stack := LoggerMiddleware(router)
+	   auth := AuthMiddleware
+	   check := func(perm string) func(http.HandlerFunc) http.HandlerFunc {
+	       return Authorize(perm, userSvc, roleSvc)
+	   }
 
-	// 8. Start Server
+	   // Manual wiring for high-security endpoints
+	   protectedMux.HandleFunc("DELETE /inventory/{id}",
+	       check(utils.PermInventoryDelete)(invH.HandleDelete),
+	   )
+	*/
+
+	// 2. Mount Protected Mux
+	// Chain: Request -> StripPrefix -> AuthMiddleware -> ProtectedMux
+	rootMux.Handle("/api/v1/", http.StripPrefix("/api/v1", AuthMiddleware(protectedMux)))
+
+	// =========================================================================
+	// 5. Server Start
+	// =========================================================================
+	finalHandler := LoggerMiddleware(rootMux)
+
 	srv := &http.Server{
 		Addr:         port,
-		Handler:      stack,
+		Handler:      finalHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -100,53 +135,82 @@ func main() {
 	}
 }
 
-// --- Login Handler Implementation ---
-// Since we didn't put this in UserHandler, we define it here to glue Auth + User
-func makeLoginHandler(userSvc user.UserService) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "Invalid body", http.StatusBadRequest)
+// =========================================================================
+// Middleware
+// =========================================================================
+
+// AuthMiddleware: AUTHENTICATION
+// Verifies who the user is via JWT.
+func AuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Authorization header required", http.StatusUnauthorized)
 			return
 		}
 
-		// 1. Get User
-		u, err := userSvc.GetUser(r.Context(), body.Username)
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			http.Error(w, "Invalid authorization format", http.StatusUnauthorized)
+			return
+		}
+
+		// Validate Token (Stateless check)
+		claims, err := user.ValidateToken(parts[1])
 		if err != nil {
-			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}
 
-		// 2. Check Password
-		// Note: Ensure your UserService.RegisterUser uses utils.HashPassword
-		if !utils.CheckPassword(body.Password, u.Hash) {
-			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-			return
-		}
+		// Context Injection
+		ctx := context.WithValue(r.Context(), utils.UserIDKey, claims.UserID)
+		ctx = context.WithValue(ctx, utils.RoleKey, claims.Role)
 
-		// 3. Generate Token
-		token, err := utils.GenerateToken(u.Id, u.Role)
-		if err != nil {
-			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
-			return
-		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"token": token,
-			"user": map[string]any{
-				"id":       u.Id,
-				"username": u.Username,
-				"role":     u.Role,
-			},
-		})
+// Authorize: AUTHORIZATION
+// Verifies if the authenticated user has the specific permission.
+// It bridges User Domain (Entity) and Role Domain (Policy Source).
+func Authorize(requiredPerm string, userSvc user.UserService, roleSvc role.RoleService) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+
+			// 1. Get UserID from Context (Set by AuthMiddleware)
+			userID, ok := r.Context().Value(utils.UserIDKey).(int)
+			if !ok {
+				http.Error(w, "User context missing", http.StatusUnauthorized)
+				return
+			}
+
+			// 2. Fetch Full User (To access .Can method and current Role)
+			u, err := userSvc.GetUser(r.Context(), userID)
+			if err != nil {
+				http.Error(w, "User not found", http.StatusUnauthorized)
+				return
+			}
+
+			// 3. Fetch Dynamic Policy from Role Service (DB)
+			// Optimization: You should cache this map in production!
+			policy, err := roleSvc.GetPolicyMap(r.Context())
+			if err != nil {
+				http.Error(w, "Failed to load permissions", http.StatusInternalServerError)
+				return
+			}
+
+			// 4. Perform the Domain Check
+			if !u.Can(requiredPerm, policy) {
+				http.Error(w, "Access Denied: Missing "+requiredPerm, http.StatusForbidden)
+				return
+			}
+
+			next(w, r)
+		}
 	}
 }
 
-// --- Simple Logger Middleware ---
+// LoggerMiddleware logs request duration
 func LoggerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -155,10 +219,13 @@ func LoggerMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- Env Helper ---
+// =========================================================================
+// Utils
+// =========================================================================
+
 func getEnv(key, fallback string) string {
-	if v, exists := os.LookupEnv(key); exists {
-		return v
+	if val, ok := os.LookupEnv(key); ok {
+		return val
 	}
 	return fallback
 }

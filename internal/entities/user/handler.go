@@ -218,6 +218,39 @@ func (h *UserHandler) HandleUpdateSettings(w http.ResponseWriter, r *http.Reques
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"status": "settings updated"})
 }
 
+// --- Login ---
+
+func (h *UserHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Call the Service
+	token, u, err := h.service.Login(r.Context(), body.Username, body.Password)
+	if err != nil {
+		// Log the error internally if you have a logger, but return generic msg to user
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Return Token and User Info
+	h.respondWithJSON(w, http.StatusOK, map[string]any{
+		"token": token,
+		"user": map[string]any{
+			"id":           u.Id,
+			"username":     u.Username,
+			"display_name": u.DisplayName,
+			"role":         u.Role,
+		},
+	})
+}
+
 // --- Helpers ---
 
 func (h *UserHandler) respondWithJSON(w http.ResponseWriter, code int, payload any) {
