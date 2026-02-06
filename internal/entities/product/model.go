@@ -1,4 +1,4 @@
-package main
+package product
 
 type Product struct { // This can be a single product, or a package of product
 	Id     int
